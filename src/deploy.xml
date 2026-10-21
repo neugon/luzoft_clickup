@@ -1,0 +1,5 @@
+<deploy>
+    <files>
+        <path>~/FileCabinet/SuiteScripts/Luzoft/Module7/*</path>
+    </files>
+</deploy>
