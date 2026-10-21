@@ -1,0 +1,174 @@
+name: Codex Issue Worker
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  codex:
+    # Only run for comments in Issues (not PRs) that start with /codex
+    if: >
+      !github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/codex')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Codex branch
+        id: branch
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="codex/issue-${ISSUE_NUMBER}"
+
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          permission-profile: ":workspace"
+          prompt: |
+            Work on GitHub Issue #${{ github.event.issue.number }}
+            in repository ${{ github.repository }}.
+
+            ISSUE TITLE
+            ===========
+            ${{ github.event.issue.title }}
+
+            ORIGINAL ISSUE REQUIREMENTS
+            ===========================
+            ${{ github.event.issue.body }}
+
+            CURRENT INSTRUCTION
+            ===================
+            ${{ github.event.comment.body }}
+
+            INSTRUCTIONS
+            ============
+
+            Inspect the existing repository before making changes.
+
+            Implement the requirements described in the GitHub Issue
+            and in the current instruction.
+
+            Preserve existing working functionality.
+
+            Reuse the existing implementation when appropriate.
+
+            Do not restart the implementation from scratch if this
+            branch already contains previous Codex work.
+
+            Run relevant tests when possible.
+
+            Make the required code changes directly in the workspace.
+
+            Do not commit or push changes yourself.
+            The GitHub workflow will handle commits and the Pull Request.
+
+            When finished, report:
+            - Files modified
+            - Changes implemented
+            - Tests performed
+            - Assumptions
+            - Remaining risks
+
+      - name: Commit and push changes
+        id: changes
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No code changes were produced."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "Codex implementation for issue #${ISSUE_NUMBER}"
+
+          git push -u origin "$BRANCH"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or find Pull Request
+        if: steps.changes.outputs.changed == 'true'
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          PR_URL=$(gh pr list \
+            --head "$BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url')
+
+          if [ -z "$PR_URL" ]; then
+            PR_URL=$(gh pr create \
+              --base "$DEFAULT_BRANCH" \
+              --head "$BRANCH" \
+              --title "Codex: #${ISSUE_NUMBER} ${ISSUE_TITLE}" \
+              --body "Automated implementation for GitHub Issue #${ISSUE_NUMBER}.")
+          fi
+
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Report result to Issue
+        if: always() && steps.codex.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          CHANGED: ${{ steps.changes.outputs.changed }}
+          CODEX_RESULT: ${{ steps.codex.outputs.final-message }}
+        run: |
+          if [ "$CHANGED" = "true" ]; then
+            BODY="Codex completed the implementation.
+
+          Pull Request:
+          ${PR_URL}
+
+          Codex result:
+          ${CODEX_RESULT}"
+          else
+            BODY="Codex completed the analysis but did not produce code changes.
+
+          Codex result:
+          ${CODEX_RESULT}"
+          fi
+
+          gh issue comment "$ISSUE_NUMBER" --body "$BODY"
